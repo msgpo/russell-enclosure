@@ -260,3 +260,165 @@ class EnclosureRussell(Enclosure):
 
     E.g. Start and Stop talk animation
     """
+
+    _last_internet_notification = 0
+
+    def __init__(self):
+        super().__init__()
+
+        self.__init_serial()
+        self.reader = EnclosureReader(self.serial, self.bus, self.lang)
+        self.writer = EnclosureWriter(self.serial, self.bus)
+
+        # Prepare to receive message when the Arduino responds to the
+        # following "system.version"
+        self.bus.on("enclosure.started", self.on_arduino_responded)
+        self.arduino_responded = False
+        # Send a message to the Arduino across the serial line asking
+        # for a reply with version info.
+        self.writer.write("system.version")
+        # Start a 5 second timer.  If the serial port hasn't received
+        # any acknowledgement of the "system.version" within those
+        # 5 seconds, assume there is nothing on the other end (e.g.
+        # we aren't running a Mark 1 with an Arduino)
+        Timer(5, self.check_for_response).start()
+
+        # Notifications from mycroft-core
+        self.bus.on("enclosure.notify.no_internet", self.on_no_internet)
+
+        # initiates the web sockets on display manager
+        # NOTE: this is a temporary place to connect the display manager
+        init_display_manager_bus_connection()
+
+    def on_arduino_responded(self, event=None):
+    #    self.eyes = EnclosureEyes(self.bus, self.writer)
+    #    self.mouth = EnclosureMouth(self.bus, self.writer)
+        self.system = EnclosureArduino(self.bus, self.writer)
+        self.__register_events()
+        self.__reset()
+        self.arduino_responded = True
+
+        # verify internet connection and prompt user on bootup if needed
+        if not connected():
+            # We delay this for several seconds to ensure that the other
+            # clients are up and connected to the messagebus in order to
+            # receive the "speak".  This was sometimes happening too
+            # quickly and the user wasn't notified what to do.
+            Timer(5, self._do_net_check).start()
+
+    def on_no_internet(self, event=None):
+        if connected():
+            # One last check to see if connection was established
+            return
+
+        if time.time() - Enclosure._last_internet_notification < 30:
+            # don't bother the user with multiple notifications with 30 secs
+            return
+
+        Enclosure._last_internet_notification = time.time()
+
+        # TODO: This should go into EnclosureMark1 subclass of Enclosure.
+        if has_been_paired():
+            # Handle the translation within that code.
+            self.bus.emit(Message("speak", {
+                'utterance': "This device is not connected to the Internet. "
+                             "Either plug in a network cable or hold the "
+                             "button on top for two seconds, then select "
+                             "wifi from the menu"}))
+        else:
+            # enter wifi-setup mode automatically
+            self.bus.emit(Message('system.wifi.setup', {'lang': self.lang}))
+
+    def __init_serial(self):
+        try:
+            self.port = self.config.get("port")
+            self.rate = self.config.get("rate")
+            self.timeout = self.config.get("timeout")
+            self.serial = serial.serial_for_url(
+                url=self.port, baudrate=self.rate, timeout=self.timeout)
+            LOG.info("Connected to: %s rate: %s timeout: %s" %
+                     (self.port, self.rate, self.timeout))
+        except Exception:
+            LOG.error("Impossible to connect to serial port: "+str(self.port))
+            raise
+
+    def __register_events(self):
+        #self.bus.on('enclosure.mouth.events.activate',
+                    self.__register_mouth_events)
+        #self.bus.on('enclosure.mouth.events.deactivate',
+                    self.__remove_mouth_events)
+        self.bus.on('enclosure.reset',
+                    self.__reset)
+        #self.__register_mouth_events()
+
+    def __register_mouth_events(self, event=None):
+        self.bus.on('recognizer_loop:record_begin', self.mouth.listen)
+        self.bus.on('recognizer_loop:record_end', self.mouth.reset)
+        self.bus.on('recognizer_loop:audio_output_start', self.mouth.talk)
+        self.bus.on('recognizer_loop:audio_output_end', self.mouth.reset)
+
+    def __remove_mouth_events(self, event=None):
+        self.bus.remove('recognizer_loop:record_begin', self.mouth.listen)
+        self.bus.remove('recognizer_loop:record_end', self.mouth.reset)
+        self.bus.remove('recognizer_loop:audio_output_start',
+                        self.mouth.talk)
+        self.bus.remove('recognizer_loop:audio_output_end',
+                        self.mouth.reset)
+
+    def __reset(self, event=None):
+        # Reset both the mouth and the eye elements to indicate the unit is
+        # ready for input.
+        #self.writer.write("eyes.reset")
+        #self.writer.write("mouth.reset")
+        # Filler to be placed
+        pass
+
+    def speak(self, text):
+        self.bus.emit(Message("speak", {'utterance': text}))
+
+    def check_for_response(self):
+        if not self.arduino_responded:
+            # There is nothing on the other end of the serial port
+            # close these serial-port readers and this process
+            self.writer.stop()
+            self.reader.stop()
+            self.serial.close()
+            self.bus.close()
+
+    def _handle_pairing_complete(self, Message):
+        """
+            Handler for 'mycroft.paired', unmutes the mic after the pairing is
+            complete.
+        """
+        self.bus.emit(Message("mycroft.mic.unmute"))
+
+    def _do_net_check(self):
+        # TODO: This should live in the derived Enclosure, e.g. EnclosureMark1
+        LOG.info("Checking internet connection")
+        if not connected():  # and self.conn_monitor is None:
+            if has_been_paired():
+                # TODO: Enclosure/localization
+                self.speak("This unit is not connected to the Internet. "
+                           "Either plug in a network cable or hold the "
+                           "button on top for two seconds, then select "
+                           "wifi from the menu")
+            else:
+                # Begin the unit startup process, this is the first time it
+                # is being run with factory defaults.
+
+                # TODO: This logic should be in EnclosureMark1
+                # TODO: Enclosure/localization
+
+                # Don't listen to mic during this out-of-box experience
+                self.bus.emit(Message("mycroft.mic.mute"))
+                # Setup handler to unmute mic at the end of on boarding
+                # i.e. after pairing is complete
+                self.bus.once('mycroft.paired', self._handle_pairing_complete)
+
+                self.speak(mycroft.dialog.get('mycroft.intro'))
+                wait_while_speaking()
+                time.sleep(2)  # a pause sounds better than just jumping in
+
+                # Kick off wifi-setup automatically
+                data = {'allow_timeout': False, 'lang': self.lang}
+                self.bus.emit(Message('system.wifi.setup', data))
